@@ -1,62 +1,294 @@
 // Package nvd is the library behind the nvd command line:
-// the HTTP client, request shaping, and the typed data models for nvd.
+// the HTTP client, request shaping, and typed data models for the
+// NIST National Vulnerability Database CVE API.
 //
 // The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// User-Agent, paces requests to stay within NVD rate limits, and retries
+// transient failures (429 and 5xx) with exponential backoff.
 package nvd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to nvd. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "nvd/dev (+https://github.com/tamnd/nvd-cli)"
+// Host is the NVD API host.
+const Host = "services.nvd.nist.gov"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at nvd.com; change it once you
-// know the real endpoints you want to read.
-const Host = "nvd.com"
+// BaseURL is the full NVD CVE 2.0 API endpoint.
+const BaseURL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to nvd over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds all tunables for the NVD client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	APIKey    string        // optional; when set, appended as ?apiKey=<key>
+	Rate      time.Duration // min gap between requests
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// DefaultConfig returns the recommended defaults.
+// Without a key NVD allows 5 requests per 30 seconds (≈ 1 per 6s); we use
+// 600ms as a comfortable pace for single-threaded use.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		UserAgent: "nvd-cli/0.1.0 (github.com/tamnd/nvd-cli)",
+		APIKey:    "",
+		Rate:      600 * time.Millisecond,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to the NVD CVE 2.0 API.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client using the supplied Config.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// --- CVE data model ---
+
+// CVE is a flat record extracted from the nested NVD API response.
+type CVE struct {
+	ID           string   `json:"id"            kit:"id"`
+	Published    string   `json:"published"`
+	LastModified string   `json:"last_modified"`
+	Status       string   `json:"status"`
+	Description  string   `json:"description"   kit:"body"`
+	Score        *float64 `json:"cvss_score,omitempty"`
+	Severity     string   `json:"severity,omitempty"`
+	CWEs         []string `json:"cwes,omitempty"`
+	References   []string `json:"references,omitempty"`
+}
+
+// --- NVD API response shapes (used only for JSON decoding) ---
+
+type nvdResponse struct {
+	ResultsPerPage int    `json:"resultsPerPage"`
+	StartIndex     int    `json:"startIndex"`
+	TotalResults   int    `json:"totalResults"`
+	Vulnerabilities []struct {
+		CVE nvdCVE `json:"cve"`
+	} `json:"vulnerabilities"`
+}
+
+type nvdCVE struct {
+	ID             string `json:"id"`
+	Published      string `json:"published"`
+	LastModified   string `json:"lastModified"`
+	VulnStatus     string `json:"vulnStatus"`
+	Descriptions   []struct {
+		Lang  string `json:"lang"`
+		Value string `json:"value"`
+	} `json:"descriptions"`
+	Metrics struct {
+		V31 []struct {
+			CVSSData struct {
+				BaseScore    float64 `json:"baseScore"`
+				BaseSeverity string  `json:"baseSeverity"`
+			} `json:"cvssData"`
+		} `json:"cvssMetricV31"`
+		V30 []struct {
+			CVSSData struct {
+				BaseScore    float64 `json:"baseScore"`
+				BaseSeverity string  `json:"baseSeverity"`
+			} `json:"cvssData"`
+		} `json:"cvssMetricV30"`
+		V2 []struct {
+			CVSSData struct {
+				BaseScore float64 `json:"baseScore"`
+			} `json:"cvssData"`
+			BaseSeverity string `json:"baseSeverity"`
+		} `json:"cvssMetricV2"`
+	} `json:"metrics"`
+	Weaknesses []struct {
+		Description []struct {
+			Lang  string `json:"lang"`
+			Value string `json:"value"`
+		} `json:"description"`
+	} `json:"weaknesses"`
+	References []struct {
+		URL    string `json:"url"`
+		Source string `json:"source"`
+	} `json:"references"`
+}
+
+// flatten converts the raw NVD API CVE into our clean record.
+func flatten(raw nvdCVE) *CVE {
+	c := &CVE{
+		ID:           raw.ID,
+		Published:    raw.Published,
+		LastModified: raw.LastModified,
+		Status:       raw.VulnStatus,
+	}
+	// Description: first English entry
+	for _, d := range raw.Descriptions {
+		if d.Lang == "en" {
+			c.Description = d.Value
+			break
+		}
+	}
+	// CVSS score: prefer V3.1, then V3.0, then V2
+	switch {
+	case len(raw.Metrics.V31) > 0:
+		s := raw.Metrics.V31[0].CVSSData.BaseScore
+		c.Score = &s
+		c.Severity = raw.Metrics.V31[0].CVSSData.BaseSeverity
+	case len(raw.Metrics.V30) > 0:
+		s := raw.Metrics.V30[0].CVSSData.BaseScore
+		c.Score = &s
+		c.Severity = raw.Metrics.V30[0].CVSSData.BaseSeverity
+	case len(raw.Metrics.V2) > 0:
+		s := raw.Metrics.V2[0].CVSSData.BaseScore
+		c.Score = &s
+		c.Severity = raw.Metrics.V2[0].BaseSeverity
+	}
+	// CWEs
+	seen := map[string]bool{}
+	for _, w := range raw.Weaknesses {
+		for _, d := range w.Description {
+			if d.Lang == "en" && !seen[d.Value] {
+				seen[d.Value] = true
+				c.CWEs = append(c.CWEs, d.Value)
+			}
+		}
+	}
+	// References
+	for _, r := range raw.References {
+		if r.URL != "" {
+			c.References = append(c.References, r.URL)
+		}
+	}
+	return c
+}
+
+// --- Public API ---
+
+// CVE fetches a single CVE by ID (e.g. "CVE-2021-44228").
+func (c *Client) CVE(ctx context.Context, id string) (*CVE, error) {
+	u := c.buildURL(url.Values{"cveId": {id}})
+	resp, err := c.fetch(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Vulnerabilities) == 0 {
+		return nil, fmt.Errorf("CVE %s not found", id)
+	}
+	return flatten(resp.Vulnerabilities[0].CVE), nil
+}
+
+// SearchOptions controls keyword search parameters.
+type SearchOptions struct {
+	Limit    int
+	Severity string // LOW, MEDIUM, HIGH, CRITICAL
+}
+
+// Search searches CVEs by keyword.
+func (c *Client) Search(ctx context.Context, keyword string, opts SearchOptions) ([]*CVE, error) {
+	params := url.Values{"keywordSearch": {keyword}}
+	if opts.Limit > 0 {
+		params.Set("resultsPerPage", fmt.Sprintf("%d", opts.Limit))
+	}
+	if opts.Severity != "" {
+		params.Set("cvssV3Severity", strings.ToUpper(opts.Severity))
+	}
+	resp, err := c.fetch(ctx, c.buildURL(params))
+	if err != nil {
+		return nil, err
+	}
+	return collectCVEs(resp), nil
+}
+
+// RecentOptions controls the recent CVEs query.
+type RecentOptions struct {
+	Days     int
+	Limit    int
+	Severity string
+}
+
+// Recent returns CVEs published in the last N days.
+func (c *Client) Recent(ctx context.Context, opts RecentOptions) ([]*CVE, error) {
+	days := opts.Days
+	if days <= 0 {
+		days = 7
+	}
+	end := time.Now().UTC()
+	start := end.AddDate(0, 0, -days)
+	const layout = "2006-01-02T15:04:05.000"
+	params := url.Values{
+		"pubStartDate": {start.Format(layout)},
+		"pubEndDate":   {end.Format(layout)},
+	}
+	if opts.Limit > 0 {
+		params.Set("resultsPerPage", fmt.Sprintf("%d", opts.Limit))
+	}
+	if opts.Severity != "" {
+		params.Set("cvssV3Severity", strings.ToUpper(opts.Severity))
+	}
+	resp, err := c.fetch(ctx, c.buildURL(params))
+	if err != nil {
+		return nil, err
+	}
+	return collectCVEs(resp), nil
+}
+
+func collectCVEs(resp *nvdResponse) []*CVE {
+	out := make([]*CVE, 0, len(resp.Vulnerabilities))
+	for _, v := range resp.Vulnerabilities {
+		out = append(out, flatten(v.CVE))
+	}
+	return out
+}
+
+// buildURL constructs the full request URL by appending params to cfg.BaseURL.
+func (c *Client) buildURL(params url.Values) string {
+	base := c.cfg.BaseURL
+	if c.cfg.APIKey != "" {
+		params.Set("apiKey", c.cfg.APIKey)
+	}
+	q := params.Encode()
+	if strings.Contains(base, "?") {
+		return base + "&" + q
+	}
+	return base + "?" + q
+}
+
+// fetch GETs a fully-built URL and decodes the NVD JSON response.
+func (c *Client) fetch(ctx context.Context, rawURL string) (*nvdResponse, error) {
+	body, err := c.get(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var resp nvdResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode NVD response: %w", err)
+	}
+	return &resp, nil
+}
+
+// get performs a paced, retried GET and returns the raw body.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +296,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +305,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -104,12 +337,14 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// pace blocks until at least Rate has elapsed since the last request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -121,80 +356,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on nvd.com. It is a stand-in for the typed records you
-// will model from the real nvd endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `nvd cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

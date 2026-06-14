@@ -6,9 +6,8 @@ import (
 	"github.com/tamnd/any-cli/kit"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in nvd_test.go.
+// These tests exercise the URI driver's pure string functions and the host
+// wiring. No network is required.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -24,10 +23,13 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in, typ, id string
+	}{
+		{"CVE-2021-44228", "cve", "CVE-2021-44228"},
+		{"cve-2021-44228", "cve", "CVE-2021-44228"},
+		{"https://nvd.nist.gov/vuln/detail/CVE-2021-44228", "cve", "CVE-2021-44228"},
+		{"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2024-0001", "cve", "CVE-2024-0001"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
@@ -38,39 +40,58 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestClassifyInvalid(t *testing.T) {
+	_, _, err := Domain{}.Classify("not-a-cve")
+	if err == nil {
+		t.Error("expected error for invalid input, got nil")
+	}
+}
+
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+	got, err := Domain{}.Locate("cve", "CVE-2021-44228")
+	want := "https://nvd.nist.gov/vuln/detail/CVE-2021-44228"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
+func TestLocateInvalidType(t *testing.T) {
+	_, err := Domain{}.Locate("page", "CVE-2021-44228")
+	if err == nil {
+		t.Error("expected error for unknown type, got nil")
+	}
+}
+
+// TestHostWiring mounts the driver in a kit Host and checks round-trip: mint,
+// body, and resolve. The init() in domain.go registers the domain.
 func TestHostWiring(t *testing.T) {
 	h, err := kit.Open()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+	score := 10.0
+	cve := &CVE{
+		ID:          "CVE-2021-44228",
+		Description: "Apache Log4j2 RCE vulnerability.",
+		Score:       &score,
+		Severity:    "CRITICAL",
+	}
+
+	u, err := h.Mint(cve)
 	if err != nil {
 		t.Fatalf("Mint: %v", err)
 	}
-	if want := "nvd://page/wiki/Go"; u.String() != want {
+	if want := "nvd://cve/CVE-2021-44228"; u.String() != want {
 		t.Errorf("Mint = %q, want %q", u.String(), want)
 	}
 
-	if body, ok := h.Body(p); !ok || body == "" {
+	if body, ok := h.Body(cve); !ok || body == "" {
 		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
 	}
 
-	got, err := h.ResolveOn("nvd", "about")
-	if err != nil || got.String() != "nvd://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want nvd://page/about", got.String(), err)
+	got, err := h.ResolveOn("nvd", "CVE-2024-0001")
+	if err != nil || got.String() != "nvd://cve/CVE-2024-0001" {
+		t.Errorf("ResolveOn = (%q, %v), want nvd://cve/CVE-2024-0001", got.String(), err)
 	}
 }
